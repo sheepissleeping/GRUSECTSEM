@@ -1,0 +1,522 @@
+# =============================================================================
+# 基于混淆矩阵的敏感性分析：经验误差模型
+# =============================================================================
+# 
+# 审稿人质疑：
+#   "噪声注入策略依赖于额外的随机错误分类，而非基于分类器实际混淆结构
+#    的经验错误模型"
+#
+# 之前的做法（论文中）：随机抽2%/5%/8%的标签，均匀随机改成其他6类
+# 现在的做法：按混淆矩阵的经验错误率和误判方向翻转标签
+#   - 每个类别有不同的翻转概率（如dis=81.2%, neu=1.9%）
+#   - 翻转的目标类别遵循混淆矩阵行归一化分布（如dis→neu占69.2%）
+#   - 缩放因子×0.25到×1.25覆盖保守到极端场景
+#
+# 混淆矩阵来源：seed=42, epoch 111, WA=64.96%, UA=42.77%
+# =============================================================================
+
+cat("\n")
+cat("═══════════════════════════════════════════════════════════════════\n")
+cat("  基于混淆矩阵的敏感性分析：经验误差模型\n")
+cat("  回应审稿人：随机噪声 → 结构化经验误差\n")
+cat("═══════════════════════════════════════════════════════════════════\n\n")
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ctsem)
+  library(zoo)
+})
+
+# =============================================================================
+# 第1步：配置
+# =============================================================================
+config <- list(
+  data_path = "D:/data.xlsx",
+  save_path = "C:/Users/48538/Desktop/sanxiu/confusion_sensitivity",
+  # 缩放因子：×1.0 = 完全模拟分类器实际错误率
+  noise_scales = c(0.00, 0.25, 0.50, 0.75, 1.00, 1.25),
+  n_iterations = 3,        # 每个非零水平重复次数
+  base_seed = 2025,
+  smooth_window = 3         # 3点移动平均（与原始分析一致！）
+)
+
+if(!dir.exists(config$save_path)) dir.create(config$save_path, recursive = TRUE)
+if(!dir.exists(file.path(config$save_path, "plots"))) {
+  dir.create(file.path(config$save_path, "plots"))
+}
+
+# =============================================================================
+# 第2步：定义混淆矩阵
+# =============================================================================
+cat("构建混淆矩阵和经验误差分布...\n\n")
+
+emotion_labels <- c("hap", "sad", "neu", "ang", "sur", "dis", "fea")
+
+# PAD映射
+pad_P <- c(hap=0.4, sad=-0.4, neu=0, ang=-0.51, sur=0.2, dis=-0.4, fea=-0.64)
+pad_A <- c(hap=0.2, sad=-0.2, neu=0, ang=0.59, sur=0.45, dis=0.2, fea=0.6)
+
+# 混淆矩阵（行=真实, 列=预测）
+# seed=42, epoch 111, WA=64.96%
+confusion_raw <- matrix(
+  c(20, 0, 2, 0, 1, 0, 0,   # hap
+     1, 0, 1, 0, 2, 0, 1,   # sad
+     0, 0,51, 0, 0, 0, 1,   # neu
+     1, 0, 2, 1, 3, 0, 1,   # ang
+     1, 0, 8, 0, 9, 0, 1,   # sur
+     1, 0, 9, 0, 2, 3, 1,   # dis
+     2, 0, 3, 3, 1, 0, 5),  # fea
+  nrow = 7, ncol = 7, byrow = TRUE,
+  dimnames = list(emotion_labels, emotion_labels)
+)
+
+cat("混淆矩阵（原始计数）：\n")
+print(confusion_raw)
+
+# 每个类别的经验错误率
+row_totals <- rowSums(confusion_raw)
+correct <- diag(confusion_raw)
+error_rates <- 1 - correct / row_totals
+
+cat("\n各类别经验错误率：\n")
+for(i in 1:7) {
+  cat(sprintf("  %s: %.1f%% 错误率 (%d/%d正确)\n", 
+              emotion_labels[i], error_rates[i]*100, correct[i], row_totals[i]))
+}
+
+# 误分类方向概率（排除对角线后行归一化）
+misclass_probs <- confusion_raw
+diag(misclass_probs) <- 0
+row_sums_off <- rowSums(misclass_probs)
+row_sums_off[row_sums_off == 0] <- 1
+misclass_probs <- misclass_probs / row_sums_off
+
+cat("\n误分类方向概率（当发生误判时，判成什么）：\n")
+print(round(misclass_probs, 3))
+cat("\n")
+
+# =============================================================================
+# 第3步：加载数据
+# =============================================================================
+cat("正在加载数据...\n")
+
+dat_raw <- read_excel(config$data_path)
+
+dat_raw <- dat_raw %>%
+  rename(
+    id = name,
+    time = start_second,
+    emotion_label = label,
+    Neuroticism = Negative_Emotionality,
+    Openness = Open_Mindedness
+  ) %>%
+  mutate(
+    id = as.character(id),
+    time = as.numeric(time),
+    emotion_label = factor(emotion_label, levels = emotion_labels)
+  ) %>%
+  filter(complete.cases(P, A, id, time))
+
+cat(sprintf("✅ 数据：%d观测, %d个体\n\n", nrow(dat_raw), length(unique(dat_raw$id))))
+
+# =============================================================================
+# 第4步：基线数据准备（与原始分析完全一致）
+# =============================================================================
+# 3点移动平均平滑 — 这是必须的！没有平滑CTSEM无法收敛
+dat_baseline <- dat_raw %>%
+  group_by(id) %>%
+  arrange(time) %>%
+  mutate(
+    P_smooth = zoo::rollmean(P, k = config$smooth_window, fill = "extend"),
+    A_smooth = zoo::rollmean(A, k = config$smooth_window, fill = "extend")
+  ) %>%
+  ungroup()
+
+# 固定标准化参数（所有条件使用相同基准）
+std_params <- list(
+  P_mean = mean(dat_baseline$P_smooth),
+  P_sd   = sd(dat_baseline$P_smooth),
+  A_mean = mean(dat_baseline$A_smooth),
+  A_sd   = sd(dat_baseline$A_smooth),
+  age_mean = mean(dat_baseline$age),
+  age_sd   = sd(dat_baseline$age),
+  gender_mean = mean(dat_baseline$gender),
+  E_mean = mean(dat_baseline$Extraversion),    E_sd = sd(dat_baseline$Extraversion),
+  Agr_mean = mean(dat_baseline$Agreeableness), Agr_sd = sd(dat_baseline$Agreeableness),
+  Con_mean = mean(dat_baseline$Conscientiousness), Con_sd = sd(dat_baseline$Conscientiousness),
+  Neu_mean = mean(dat_baseline$Neuroticism),   Neu_sd = sd(dat_baseline$Neuroticism),
+  Ope_mean = mean(dat_baseline$Openness),      Ope_sd = sd(dat_baseline$Openness)
+)
+
+# =============================================================================
+# 第5步：核心函数 — 基于混淆矩阵的噪声注入
+# =============================================================================
+add_confusion_noise <- function(emotion_vec, scale, error_rates, misclass_matrix, seed) {
+  set.seed(seed)
+  n <- length(emotion_vec)
+  noised <- as.character(emotion_vec)
+  n_flipped <- 0
+  
+  for(i in 1:n) {
+    label <- noised[i]
+    label_idx <- match(label, emotion_labels)
+    
+    # 该类别的经验错误率 × 缩放因子 = 翻转概率
+    flip_prob <- error_rates[label_idx] * scale
+    flip_prob <- min(flip_prob, 1.0)
+    
+    if(runif(1) < flip_prob) {
+      target_probs <- misclass_matrix[label_idx, ]
+      if(sum(target_probs) > 0) {
+        noised[i] <- sample(emotion_labels, 1, prob = target_probs)
+        n_flipped <- n_flipped + 1
+      }
+    }
+  }
+  
+  list(
+    labels = factor(noised, levels = emotion_labels),
+    n_flipped = n_flipped,
+    flip_rate = n_flipped / n
+  )
+}
+
+# =============================================================================
+# 第6步：CTSEM数据准备和拟合函数
+# =============================================================================
+prepare_and_standardize <- function(dat, std_params) {
+  dat %>%
+    mutate(
+      P_std = (P_smooth - std_params$P_mean) / std_params$P_sd,
+      A_std = (A_smooth - std_params$A_mean) / std_params$A_sd,
+      age_z = (age - std_params$age_mean) / std_params$age_sd,
+      gender_c = gender - std_params$gender_mean,
+      Extraversion_z = (Extraversion - std_params$E_mean) / std_params$E_sd,
+      Agreeableness_z = (Agreeableness - std_params$Agr_mean) / std_params$Agr_sd,
+      Conscientiousness_z = (Conscientiousness - std_params$Con_mean) / std_params$Con_sd,
+      Neuroticism_z = (Neuroticism - std_params$Neu_mean) / std_params$Neu_sd,
+      Openness_z = (Openness - std_params$Ope_mean) / std_params$Ope_sd
+    ) %>%
+    select(id, time, P_std, A_std, age_z, gender_c,
+           Extraversion_z, Agreeableness_z, Conscientiousness_z,
+           Neuroticism_z, Openness_z) %>%
+    rename(P = P_std, A = A_std,
+           age = age_z, gender = gender_c,
+           Extraversion = Extraversion_z, Agreeableness = Agreeableness_z,
+           Conscientiousness = Conscientiousness_z,
+           Neuroticism = Neuroticism_z, Openness = Openness_z) %>%
+    group_by(id) %>% filter(n() >= 3) %>% ungroup() %>%
+    as.data.frame()
+}
+
+ti_covs <- c("age", "gender", "Extraversion", "Agreeableness",
+             "Conscientiousness", "Neuroticism", "Openness")
+
+fit_ctsem <- function(model_data, condition_name) {
+  cat(sprintf("  拟合 %s ... ", condition_name))
+  
+  tryCatch({
+    ctsem_model <- ctModel(
+      type = 'stanct',
+      n.latent = 2, n.manifest = 2,
+      LAMBDA = diag(2),
+      manifestNames = c('P', 'A'),
+      latentNames = c('eta_P', 'eta_A'),
+      TIpredNames = ti_covs,
+      id = 'id', time = 'time'
+    )
+    
+    start_time <- Sys.time()
+    ctsem_fit <- ctStanFit(
+      datalong = model_data,
+      ctstanmodel = ctsem_model,
+      optimize = TRUE,
+      optimcontrol = list(stochastic = FALSE, finishsamples = 1000),
+      cores = 1, nopriors = TRUE, verbose = 0
+    )
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    
+    s <- summary(ctsem_fit)
+    drift <- as.data.frame(s$parmatrices) %>% filter(matrix == "DRIFT")
+    
+    cat(sprintf("✅ (%.1f分钟)\n", elapsed))
+    
+    drift_result <- data.frame(
+      condition = condition_name,
+      drift_PP = drift$Mean[drift$row == 1 & drift$col == 1],
+      drift_AA = drift$Mean[drift$row == 2 & drift$col == 2],
+      drift_PA = drift$Mean[drift$row == 2 & drift$col == 1],
+      drift_AP = drift$Mean[drift$row == 1 & drift$col == 2],
+      fit_time = elapsed
+    )
+    
+    tipred_result <- NULL
+    if(!is.null(s$tipreds)) {
+      tipred_result <- as.data.frame(s$tipreds)
+      tipred_result$parameter <- rownames(tipred_result)
+      if("Mean" %in% names(tipred_result)) tipred_result$mean <- tipred_result$Mean
+      tipred_result$condition <- condition_name
+    }
+    
+    list(drift = drift_result, tipred = tipred_result)
+    
+  }, error = function(e) {
+    cat(sprintf("❌ %s\n", e$message))
+    list(
+      drift = data.frame(condition = condition_name,
+                          drift_PP = NA, drift_AA = NA, drift_PA = NA, drift_AP = NA,
+                          fit_time = NA),
+      tipred = NULL
+    )
+  })
+}
+
+# =============================================================================
+# 第7步：运行所有条件
+# =============================================================================
+cat("═══════════════════════════════════════════════════════════════════\n")
+cat("  开始运行敏感性分析\n")
+cat("  共", 1 + length(config$noise_scales[config$noise_scales > 0]) * config$n_iterations,
+    "次CTSEM拟合\n")
+cat("═══════════════════════════════════════════════════════════════════\n\n")
+
+all_drift <- list()
+all_tipred <- list()
+all_diagnostics <- list()
+counter <- 0
+
+for(scale in config$noise_scales) {
+  
+  n_iter <- ifelse(scale == 0, 1, config$n_iterations)
+  
+  for(iter in 1:n_iter) {
+    counter <- counter + 1
+    seed <- config$base_seed + counter * 100
+    
+    condition_name <- sprintf("scale_%.2f_iter_%d", scale, iter)
+    cat(sprintf("\n── 缩放因子=%.2f, 迭代=%d ──\n", scale, iter))
+    
+    if(scale == 0) {
+      # 基线：不加噪声，直接使用原始数据
+      dat_noised <- dat_baseline
+      diag_info <- data.frame(
+        condition = condition_name, scale = scale, iter = iter,
+        n_flipped = 0, flip_rate = 0
+      )
+    } else {
+      # 基于混淆矩阵注入噪声
+      flip_result <- add_confusion_noise(
+        dat_raw$emotion_label, scale, error_rates, misclass_probs, seed
+      )
+      
+      cat(sprintf("  翻转: %d帧 (%.1f%%)\n", 
+                  flip_result$n_flipped, flip_result$flip_rate * 100))
+      
+      # 用翻转后的标签重新查PAD表
+      dat_noised <- dat_raw %>%
+        mutate(
+          emotion_label = flip_result$labels,
+          P = pad_P[as.character(emotion_label)],
+          A = pad_A[as.character(emotion_label)]
+        )
+      
+      # 3点移动平均（与原始分析一致！）
+      dat_noised <- dat_noised %>%
+        group_by(id) %>%
+        arrange(time) %>%
+        mutate(
+          P_smooth = zoo::rollmean(P, k = config$smooth_window, fill = "extend"),
+          A_smooth = zoo::rollmean(A, k = config$smooth_window, fill = "extend")
+        ) %>%
+        ungroup()
+      
+      diag_info <- data.frame(
+        condition = condition_name, scale = scale, iter = iter,
+        n_flipped = flip_result$n_flipped,
+        flip_rate = flip_result$flip_rate
+      )
+    }
+    
+    all_diagnostics[[counter]] <- diag_info
+    
+    # 标准化并拟合CTSEM
+    model_data <- prepare_and_standardize(dat_noised, std_params)
+    res <- fit_ctsem(model_data, condition_name)
+    all_drift[[counter]] <- res$drift
+    if(!is.null(res$tipred)) all_tipred[[counter]] <- res$tipred
+  }
+}
+
+# =============================================================================
+# 第8步：整理结果
+# =============================================================================
+cat("\n")
+cat("═══════════════════════════════════════════════════════════════════\n")
+cat("  整理结果\n")
+cat("═══════════════════════════════════════════════════════════════════\n\n")
+
+drift_df <- bind_rows(all_drift)
+drift_df$scale <- as.numeric(gsub("scale_(.+)_iter.*", "\\1", drift_df$condition))
+drift_df$iter <- as.integer(gsub(".*_iter_(.+)", "\\1", drift_df$condition))
+
+diag_df <- bind_rows(all_diagnostics)
+
+write.csv(drift_df, file.path(config$save_path, "confusion_DRIFT_results.csv"), row.names = FALSE)
+write.csv(diag_df, file.path(config$save_path, "confusion_noise_diagnostics.csv"), row.names = FALSE)
+cat("✅ DRIFT结果和噪声诊断已保存\n")
+
+if(length(all_tipred) > 0) {
+  tipred_df <- bind_rows(all_tipred)
+  tipred_df$scale <- as.numeric(gsub("scale_(.+)_iter.*", "\\1", tipred_df$condition))
+  write.csv(tipred_df, file.path(config$save_path, "confusion_TIpred_results.csv"), row.names = FALSE)
+  cat("✅ TI预测变量效应已保存\n")
+}
+
+# 汇总
+drift_summary <- drift_df %>%
+  group_by(scale) %>%
+  summarise(
+    PP_mean = mean(drift_PP, na.rm = TRUE), PP_sd = sd(drift_PP, na.rm = TRUE),
+    AA_mean = mean(drift_AA, na.rm = TRUE), AA_sd = sd(drift_AA, na.rm = TRUE),
+    PA_mean = mean(drift_PA, na.rm = TRUE), AP_mean = mean(drift_AP, na.rm = TRUE),
+    n = n(), .groups = "drop"
+  )
+baseline <- drift_summary %>% filter(scale == 0)
+
+cat("\n═══ DRIFT参数汇总 ═══\n\n")
+for(i in 1:nrow(drift_summary)) {
+  row <- drift_summary[i,]
+  pp_dev <- abs(row$PP_mean - baseline$PP_mean) / abs(baseline$PP_mean) * 100
+  aa_dev <- abs(row$AA_mean - baseline$AA_mean) / abs(baseline$AA_mean) * 100
+  cat(sprintf("Scale ×%.2f: P→P=%.4f  A→A=%.4f  | 偏差: PP=%.1f%% AA=%.1f%%\n",
+              row$scale, row$PP_mean, row$AA_mean, pp_dev, aa_dev))
+}
+
+write.csv(drift_summary, file.path(config$save_path, "confusion_DRIFT_summary.csv"), row.names = FALSE)
+
+# =============================================================================
+# 第9步：可视化
+# =============================================================================
+cat("\n═══ 生成可视化 ═══\n\n")
+
+# 图1：DRIFT参数稳定性
+cat("[1/3] DRIFT稳定性图...\n")
+tryCatch({
+  drift_long <- drift_df %>%
+    select(scale, iter, drift_PP, drift_AA) %>%
+    pivot_longer(cols = c(drift_PP, drift_AA),
+                 names_to = "parameter", values_to = "value") %>%
+    mutate(parameter = ifelse(parameter == "drift_PP", "P → P", "A → A"))
+  
+  ref_lines <- data.frame(
+    parameter = c("P → P", "A → A"),
+    ref = c(baseline$PP_mean, baseline$AA_mean)
+  )
+  
+  p1 <- ggplot(drift_long, aes(x = factor(scale), y = value)) +
+    geom_hline(data = ref_lines, aes(yintercept = ref),
+               linetype = "dashed", color = "red", linewidth = 0.6) +
+    geom_boxplot(fill = "#3C5488", alpha = 0.3, outlier.size = 1) +
+    geom_jitter(width = 0.1, size = 2, alpha = 0.6, color = "#3C5488") +
+    facet_wrap(~parameter, scales = "free_y") +
+    labs(
+      title = "DRIFT Parameter Stability Under Confusion-Matrix-Based Noise",
+      subtitle = "Red dashed = baseline | x1.00 = full empirical error rate",
+      x = "Confusion Matrix Scaling Factor", y = "Parameter Estimate"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+          strip.text = element_text(face = "bold", size = 14))
+  
+  ggsave(file.path(config$save_path, "plots", "01_confusion_DRIFT_stability.png"),
+         p1, width = 12, height = 6, dpi = 300)
+  cat("  ✅\n")
+}, error = function(e) cat("  ❌", e$message, "\n"))
+
+# 图2：各类别翻转率
+cat("[2/3] 类别错误率图...\n")
+tryCatch({
+  class_data <- data.frame(
+    emotion = factor(emotion_labels, levels = emotion_labels),
+    error_rate = error_rates * 100
+  )
+  
+  p2 <- ggplot(class_data, aes(x = emotion, y = error_rate, fill = emotion)) +
+    geom_col(alpha = 0.8) +
+    geom_text(aes(label = sprintf("%.1f%%", error_rate)), vjust = -0.3, size = 4) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = "Per-Class Empirical Error Rate from Confusion Matrix",
+         subtitle = "At scale x1.0, each class is flipped at exactly this rate",
+         x = "Emotion", y = "Error Rate (%)") +
+    theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+          legend.position = "none")
+  
+  ggsave(file.path(config$save_path, "plots", "02_per_class_error_rate.png"),
+         p2, width = 10, height = 6, dpi = 300)
+  cat("  ✅\n")
+}, error = function(e) cat("  ❌", e$message, "\n"))
+
+# 图3：偏差百分比
+cat("[3/3] 偏差图...\n")
+tryCatch({
+  dev_data <- drift_summary %>%
+    filter(scale > 0) %>%
+    mutate(
+      PP_dev = (PP_mean - baseline$PP_mean) / abs(baseline$PP_mean) * 100,
+      AA_dev = (AA_mean - baseline$AA_mean) / abs(baseline$AA_mean) * 100
+    ) %>%
+    select(scale, PP_dev, AA_dev) %>%
+    pivot_longer(cols = c(PP_dev, AA_dev),
+                 names_to = "param", values_to = "dev") %>%
+    mutate(param = ifelse(param == "PP_dev", "P → P", "A → A"))
+  
+  p3 <- ggplot(dev_data, aes(x = factor(scale), y = dev, fill = param)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_hline(yintercept = c(-20, 20), linetype = "dashed", color = "red") +
+    scale_fill_manual(values = c("P → P" = "#3C5488", "A → A" = "#E64B35")) +
+    labs(title = "DRIFT Deviation from Baseline",
+         subtitle = "Red dashed = +/-20% robustness threshold",
+         x = "Scaling Factor", y = "Deviation (%)", fill = "") +
+    theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "bottom")
+  
+  ggsave(file.path(config$save_path, "plots", "03_deviation_percentage.png"),
+         p3, width = 10, height = 6, dpi = 300)
+  cat("  ✅\n")
+}, error = function(e) cat("  ❌", e$message, "\n"))
+
+# =============================================================================
+# 第10步：生成报告
+# =============================================================================
+report_file <- file.path(config$save_path, "confusion_sensitivity_report.txt")
+sink(report_file)
+cat("Confusion-Matrix-Based Sensitivity Analysis Report\n")
+cat("Date:", format(Sys.time(), "%Y-%m-%d"), "\n")
+cat("Classifier: seed=42, epoch 111, WA=64.96%\n\n")
+cat("Per-class error rates:\n")
+for(i in 1:7) cat(sprintf("  %s: %.1f%%\n", emotion_labels[i], error_rates[i]*100))
+cat("\nDRIFT results:\n")
+for(i in 1:nrow(drift_summary)) {
+  row <- drift_summary[i,]
+  pp_dev <- abs(row$PP_mean - baseline$PP_mean) / abs(baseline$PP_mean) * 100
+  aa_dev <- abs(row$AA_mean - baseline$AA_mean) / abs(baseline$AA_mean) * 100
+  cat(sprintf("  Scale x%.2f: PP=%.4f (dev %.1f%%) AA=%.4f (dev %.1f%%)\n",
+              row$scale, row$PP_mean, pp_dev, row$AA_mean, aa_dev))
+}
+sink()
+cat("\n✅ 报告已保存\n")
+
+# =============================================================================
+# 完成
+# =============================================================================
+cat("\n═══════════════════════════════════════════════════════════════════\n")
+cat("  🎉 完成！共", counter, "次CTSEM拟合\n")
+cat("  保存位置：", config$save_path, "\n")
+cat("═══════════════════════════════════════════════════════════════════\n")

@@ -1,10 +1,3 @@
-# =============================================================================
-# Bootstrap CT-SEM ── 可发表版（真Bootstrap CI）
-#
-# 电脑：C:\Users\22825
-# 策略：4并行worker（8核安全）+ finishsamples=300（加速）
-# 输出：50次Bootstrap分布CI，可直接用于论文
-# =============================================================================
 
 suppressPackageStartupMessages({
     library(readxl); library(dplyr); library(tidyr)

@@ -1,25 +1,38 @@
+# =============================================================================
+# CT-SEM Bootstrap 最终正确版
+# ✅ 基于s$tipreds（已确认有效）
+# ✅ 参数名映射规则（已从诊断数据确认）：
+#     tip_X_drift_eta_P       → P_P（P自回归）
+#     tip_X_drift_eta_A       → A_A（A自回归）
+#     tip_X_drift_eta_P_eta_A → A_P（A→P交叉）
+#     tip_X_drift_eta_A_eta_P → P_A（P→A交叉）
+# ✅ 7预测变量 × 4目标 = 28行，无重复
+# ✅ 断点续存 + 分层Bootstrap
+# =============================================================================
 
 suppressPackageStartupMessages({
     library(readxl); library(dplyr); library(tidyr)
     library(ggplot2); library(ctsem); library(zoo)
-    library(foreach); library(doParallel)
 })
+
+# =============================================================================
+# 配置
+# 测试模式：n_boot=3, finish_samples=50（约20分钟）
+# 正式模式：n_boot=50, finish_samples=200（约8-12小时）
+# =============================================================================
 config <- list(
-    data_path      = "C:/Users/22825/Desktop/data.xlsx",
-    save_path      = "C:/Users/22825/Desktop/sanxiu",
-    n_boot         = 50,
+    data_path      = "D:/data.xlsx",
+    save_path      = "C:/Users/48538/Desktop/sanxiu",
+    n_boot         = 50,     # 正式版
     base_seed      = 2025,
     smooth_window  = 3,
-    n_pca_comp     = 2,
-    finish_samples = 300,   # Bootstrap用300（快）；原始样本用1000（精）
-    n_workers      = 4      # 8核机器用4，安全稳定
+    finish_samples = 200     # 正式版
 )
-
-USE_PCA        <- TRUE
 USE_STRATIFIED <- TRUE
 
-dir.create(config$save_path, recursive=TRUE, showWarnings=FALSE)
-dir.create(file.path(config$save_path,"plots"), showWarnings=FALSE)
+if(!dir.exists(config$save_path)) dir.create(config$save_path, recursive=TRUE)
+if(!dir.exists(file.path(config$save_path,"plots")))
+    dir.create(file.path(config$save_path,"plots"))
 
 # =============================================================================
 # 数据加载
@@ -31,222 +44,271 @@ dat_raw <- read_excel(config$data_path) %>%
     mutate(id=as.character(id), time=as.numeric(time)) %>%
     filter(complete.cases(P, A, id, time))
 
-dat <- dat_raw %>%
-    group_by(id) %>% arrange(time) %>%
+dat <- dat_raw %>% group_by(id) %>% arrange(time) %>%
     mutate(
         P_smooth = zoo::rollmean(P, k=config$smooth_window, fill="extend"),
         A_smooth = zoo::rollmean(A, k=config$smooth_window, fill="extend")
     ) %>% ungroup()
 
 unique_ids <- unique(dat$id)
-N          <- length(unique_ids)
+N <- length(unique_ids)
 cat(sprintf("✅ %d观测, %d个体\n\n", nrow(dat), N))
 
-# PCA降维
-BIG5_COLS <- c("Extraversion","Agreeableness","Conscientiousness","Neuroticism","Openness")
+TI_COVS <- c("age","gender","Extraversion","Agreeableness",
+             "Conscientiousness","Neuroticism","Openness")
 
-cat("══ PCA降维 ══\n")
-person_big5 <- dat %>%
-    group_by(id) %>%
-    summarise(across(all_of(BIG5_COLS), first), .groups="drop")
-big5_mat <- as.matrix(person_big5[, BIG5_COLS])
-pca_fit  <- prcomp(big5_mat, center=TRUE, scale.=TRUE)
-var_exp  <- summary(pca_fit)$importance
-
-cat(sprintf("  保留%d个主成分：\n", config$n_pca_comp))
-for(k in 1:config$n_pca_comp)
-    cat(sprintf("    PC%d: %.1f%% (累计%.1f%%)\n", k,
-                var_exp["Proportion of Variance",k]*100,
-                var_exp["Cumulative Proportion",k]*100))
-cat("  载荷矩阵：\n")
-print(round(pca_fit$rotation[,1:config$n_pca_comp], 3))
-
-pc_scores <- predict(pca_fit, newdata=big5_mat)[,1:config$n_pca_comp,drop=FALSE]
-pc_df <- as.data.frame(pc_scores)
-names(pc_df) <- paste0("PC", 1:config$n_pca_comp)
-pc_df$id <- person_big5$id
-dat <- left_join(dat, pc_df, by="id")
-
-TI_COVS <- c("age","gender", paste0("PC",1:config$n_pca_comp))
-cat(sprintf("\n📌 TI预测变量（%d个）: %s\n\n", length(TI_COVS), paste(TI_COVS,collapse=", ")))
-
-# 固定标准化参数（全局一次，Bootstrap不重算）
+# 固定标准化参数
 std_params <- list(
     P_mean=mean(dat$P_smooth), P_sd=sd(dat$P_smooth),
     A_mean=mean(dat$A_smooth), A_sd=sd(dat$A_smooth),
-    age_mean=mean(dat$age),    age_sd=sd(dat$age),
-    gender_mean=mean(dat$gender)
+    age_mean=mean(dat$age), age_sd=sd(dat$age),
+    gender_mean=mean(dat$gender),
+    E_mean=mean(dat$Extraversion),        E_sd=sd(dat$Extraversion),
+    Agr_mean=mean(dat$Agreeableness),     Agr_sd=sd(dat$Agreeableness),
+    Con_mean=mean(dat$Conscientiousness), Con_sd=sd(dat$Conscientiousness),
+    Neu_mean=mean(dat$Neuroticism),       Neu_sd=sd(dat$Neuroticism),
+    Ope_mean=mean(dat$Openness),          Ope_sd=sd(dat$Openness)
 )
-for(k in 1:config$n_pca_comp) {
-    col <- paste0("PC",k)
-    std_params[[paste0(col,"_mean")]] <- mean(dat[[col]])
-    std_params[[paste0(col,"_sd")]]   <- sd(dat[[col]])
-}
 
-# =============================================================================
-# 工具函数
-# =============================================================================
 prepare_ctsem_data <- function(dat_sub) {
-    d <- dat_sub %>% mutate(
-        P      = (P_smooth - std_params$P_mean)   / std_params$P_sd,
-        A      = (A_smooth - std_params$A_mean)   / std_params$A_sd,
-        age    = (age      - std_params$age_mean)  / std_params$age_sd,
-        gender = gender - std_params$gender_mean
-    )
-    for(k in 1:config$n_pca_comp) {
-        col <- paste0("PC",k)
-        d[[col]] <- (dat_sub[[col]] - std_params[[paste0(col,"_mean")]]) /
-                     std_params[[paste0(col,"_sd")]]
+    dat_sub %>% mutate(
+        P = (P_smooth - std_params$P_mean) / std_params$P_sd,
+        A = (A_smooth - std_params$A_mean) / std_params$A_sd,
+        age    = (age    - std_params$age_mean) / std_params$age_sd,
+        gender = gender  - std_params$gender_mean,
+        Extraversion      = (Extraversion      - std_params$E_mean)   / std_params$E_sd,
+        Agreeableness     = (Agreeableness     - std_params$Agr_mean) / std_params$Agr_sd,
+        Conscientiousness = (Conscientiousness - std_params$Con_mean) / std_params$Con_sd,
+        Neuroticism       = (Neuroticism       - std_params$Neu_mean) / std_params$Neu_sd,
+        Openness          = (Openness          - std_params$Ope_mean) / std_params$Ope_sd
+    ) %>% select(id, time, P, A, all_of(TI_COVS)) %>% as.data.frame()
+}
+
+# =============================================================================
+# ★ TIPRED提取函数（基于诊断确认的参数名规律）
+#
+# 已确认的参数名 → target 映射：
+#   tip_X_drift_eta_P       → P_P  (P自回归，DRIFT[1,1])
+#   tip_X_drift_eta_A       → A_A  (A自回归，DRIFT[2,2])
+#   tip_X_drift_eta_P_eta_A → A_P  (A→P交叉，DRIFT[1,2])
+#   tip_X_drift_eta_A_eta_P → P_A  (P→A交叉，DRIFT[2,1])
+#
+# 旧版错误根源：把eta_P和eta_P_eta_A都映射到了同一个target
+# =============================================================================
+extract_tipred <- function(fit_summary) {
+    tp_raw <- tryCatch({
+        tp <- as.data.frame(fit_summary$tipreds)
+        if(is.null(tp) || nrow(tp)==0) return(NULL)
+        tp$parameter <- rownames(tp)
+        tp$value     <- tp$mean   # s$tipreds里均值列名是"mean"
+        tp
+    }, error=function(e) { cat("    ❌ s$tipreds提取失败:", e$message, "\n"); NULL })
+
+    if(is.null(tp_raw)) return(NULL)
+
+    # 只保留drift相关参数
+    tp_drift <- tp_raw %>% filter(grepl("_drift_", parameter))
+    if(nrow(tp_drift) == 0) { cat("    ❌ 无drift参数\n"); return(NULL) }
+
+    # ★ 精确映射（已通过诊断数据确认）
+    # 注意：必须先匹配双eta（更长的后缀），再匹配单eta
+    tp_mapped <- tp_drift %>%
+        mutate(
+            predictor = sub("^tip_(.+)_drift_.*$", "\\1", parameter),
+            target = case_when(
+                # 双eta在前（防止被单eta规则误匹配）
+                grepl("_drift_eta_P_eta_A$", parameter) ~ "A_P",  # A→P交叉
+                grepl("_drift_eta_A_eta_P$", parameter) ~ "P_A",  # P→A交叉
+                # 单eta在后
+                grepl("_drift_eta_P$",       parameter) ~ "P_P",  # P自回归
+                grepl("_drift_eta_A$",       parameter) ~ "A_A",  # A自回归
+                TRUE ~ "other"
+            )
+        ) %>%
+        filter(target != "other", predictor %in% TI_COVS) %>%
+        select(parameter, predictor, target, value)
+
+    # 验证：应有7×4=28行，无重复
+    n_actual   <- nrow(tp_mapped)
+    n_expected <- length(TI_COVS) * 4
+
+    # 检查重复
+    dup_check <- tp_mapped %>%
+        group_by(predictor, target) %>%
+        summarise(n=n(), .groups="drop") %>%
+        filter(n > 1)
+
+    if(nrow(dup_check) > 0) {
+        cat("    ⚠️ 有重复！强制去重\n")
+        tp_mapped <- tp_mapped %>%
+            group_by(predictor, target) %>%
+            slice(1) %>% ungroup()
+        n_actual <- nrow(tp_mapped)
     }
-    d %>% select(id, time, P, A, all_of(TI_COVS)) %>% as.data.frame()
+
+    status <- ifelse(n_actual == n_expected,
+                     sprintf("✅ %d行（7×4，无重复）", n_actual),
+                     sprintf("⚠️ %d行（预期%d）", n_actual, n_expected))
+    cat(sprintf("    TIPRED: %s\n", status))
+
+    return(tp_mapped)
 }
 
-# 从parmatrices精准提取TIPREDEFFECT（无重复）
-extract_tipred <- function(s, ti_covs) {
-    pm <- tryCatch(as.data.frame(s$parmatrices), error=function(e) NULL)
-    if(is.null(pm)) return(NULL)
-    tp <- pm %>% filter(matrix=="TIPREDEFFECT")
-    if(nrow(tp)==0) return(NULL)
-    tp %>% mutate(
-        predictor = ti_covs[row],
-        target    = case_when(col==1~"eta_P", col==2~"eta_A", TRUE~paste0("eta_",col)),
-        parameter = paste0(predictor,"_->_",target)
-    ) %>% select(parameter, predictor, target, mean=Mean)
-}
-
-fit_one <- function(model_data, ti_covs, finish_samples=300) {
+# =============================================================================
+# 核心拟合函数
+# =============================================================================
+fit_one <- function(model_data, finish_samples=200, is_full=FALSE) {
     tryCatch({
         mod <- ctModel(
             type='stanct', n.latent=2, n.manifest=2, LAMBDA=diag(2),
             manifestNames=c('P','A'), latentNames=c('eta_P','eta_A'),
-            TIpredNames=ti_covs, id='id', time='time'
+            TIpredNames=TI_COVS, id='id', time='time'
         )
         fit <- ctStanFit(
-            datalong     = model_data,
-            ctstanmodel  = mod,
-            optimize     = TRUE,
-            optimcontrol = list(stochastic=FALSE, finishsamples=finish_samples),
+            datalong=model_data, ctstanmodel=mod, optimize=TRUE,
+            optimcontrol=list(stochastic=FALSE, finishsamples=finish_samples),
             cores=1, nopriors=TRUE, verbose=0
         )
         s  <- summary(fit)
         pm <- as.data.frame(s$parmatrices)
-        drift_pm <- pm %>% filter(matrix=="DRIFT")
-        list(
-            drift = data.frame(
-                drift_PP = drift_pm$Mean[drift_pm$row==1 & drift_pm$col==1],
-                drift_AA = drift_pm$Mean[drift_pm$row==2 & drift_pm$col==2],
-                drift_PA = drift_pm$Mean[drift_pm$row==2 & drift_pm$col==1],
-                drift_AP = drift_pm$Mean[drift_pm$row==1 & drift_pm$col==2]
-            ),
-            tipred  = extract_tipred(s, ti_covs),
-            success = TRUE
+        dm <- pm %>% filter(matrix=="DRIFT")
+
+        drift <- data.frame(
+            drift_PP = dm$Mean[dm$row==1 & dm$col==1],
+            drift_AA = dm$Mean[dm$row==2 & dm$col==2],
+            drift_PA = dm$Mean[dm$row==2 & dm$col==1],
+            drift_AP = dm$Mean[dm$row==1 & dm$col==2]
         )
-    }, error=function(e) list(drift=NULL, tipred=NULL, success=FALSE, error=e$message))
+
+        tipred <- extract_tipred(s)
+
+        if(is_full && !is.null(tipred)) {
+            cat("\n  原始样本TIPRED完整结果（28行）：\n")
+            print(tipred %>%
+                  mutate(target=factor(target,levels=c("P_P","A_A","P_A","A_P"))) %>%
+                  arrange(target, predictor) %>%
+                  select(predictor, target, value) %>%
+                  as.data.frame())
+            cat("\n")
+        }
+
+        list(drift=drift, tipred=tipred, success=TRUE)
+    }, error=function(e)
+        list(drift=NULL, tipred=NULL, success=FALSE, error=e$message))
 }
 
 # =============================================================================
-# 第1步：原始完整样本（高精度，finishsamples=1000）
+# Bootstrap样本生成
 # =============================================================================
-cat("══ 拟合原始完整样本（finishsamples=1000）══\n")
-t0       <- Sys.time()
-res_full <- fit_one(prepare_ctsem_data(dat), TI_COVS, finish_samples=1000)
-t_full   <- round(as.numeric(difftime(Sys.time(), t0, units="mins")),1)
+create_boot_sample <- function(b) {
+    set.seed(config$base_seed + b)
+    if(USE_STRATIFIED) {
+        pn  <- dat %>% group_by(id) %>%
+               summarise(Neuroticism=first(Neuroticism), .groups="drop")
+        med <- median(pn$Neuroticism)
+        hi  <- pn$id[pn$Neuroticism >= med]
+        lo  <- pn$id[pn$Neuroticism <  med]
+        c(sample(hi, ceiling(N/2), replace=TRUE),
+          sample(lo, N-ceiling(N/2), replace=TRUE))
+    } else {
+        sample(unique_ids, N, replace=TRUE)
+    }
+}
 
-if(!res_full$success) stop("原始样本拟合失败：", res_full$error)
-cat(sprintf("✅ %.1f分钟 | PP=%.4f  AA=%.4f  PA=%.4f  AP=%.4f\n\n",
-            t_full,
+make_boot_data <- function(b) {
+    sids <- create_boot_sample(b)
+    bd   <- data.frame()
+    for(j in seq_along(sids)) {
+        pd    <- dat %>% filter(id==sids[j])
+        pd$id <- paste0("b", j)
+        bd    <- rbind(bd, pd)
+    }
+    list(data=prepare_ctsem_data(bd), n_unique=length(unique(sids)))
+}
+
+# =============================================================================
+# 第1步：原始完整样本
+# =============================================================================
+cat("══ 第1步：原始完整样本（finish_samples=500）══\n")
+t0       <- Sys.time()
+res_full <- fit_one(prepare_ctsem_data(dat), finish_samples=500, is_full=TRUE)
+t_full   <- round(as.numeric(difftime(Sys.time(),t0,units="mins")),1)
+
+if(!res_full$success) stop("原始样本拟合失败")
+cat(sprintf("\n✅ 完成（%.1f分钟）\n", t_full))
+cat(sprintf("   DRIFT: PP=%.4f  AA=%.4f  PA=%.4f  AP=%.4f\n\n",
             res_full$drift$drift_PP, res_full$drift$drift_AA,
             res_full$drift$drift_PA, res_full$drift$drift_AP))
 
 # =============================================================================
-# 第2步：预生成所有Bootstrap数据集（主进程，避免worker数据竞争）
+# 第2步：Bootstrap
 # =============================================================================
-cat(sprintf("══ 预生成Bootstrap数据集（%d个）══\n", config$n_boot))
-
-make_boot_data <- function(b) {
-    set.seed(config$base_seed + b)
-    person_neu <- dat %>% group_by(id) %>%
-        summarise(Neuroticism=first(Neuroticism), .groups="drop")
-    med <- median(person_neu$Neuroticism)
-    hi  <- person_neu$id[person_neu$Neuroticism >= med]
-    lo  <- person_neu$id[person_neu$Neuroticism <  med]
-    sampled <- c(sample(hi, ceiling(N/2), replace=TRUE),
-                 sample(lo, N-ceiling(N/2), replace=TRUE))
-    boot_data <- data.frame()
-    for(j in seq_along(sampled)) {
-        pd <- dat %>% filter(id==sampled[j]); pd$id <- paste0("b",j)
-        boot_data <- rbind(boot_data, pd)
-    }
-    list(data=prepare_ctsem_data(boot_data),
-         n_unique=length(unique(sampled)))
-}
-
+cat(sprintf("══ 预生成%d个Bootstrap数据集 ══\n", config$n_boot))
 all_boot_inputs <- lapply(1:config$n_boot, make_boot_data)
-cat(sprintf("✅ %d个数据集准备完毕\n\n", config$n_boot))
+cat("✅ 准备完毕\n\n")
 
-# =============================================================================
-# 第3步：并行Bootstrap（4 workers，安全稳定）
-# =============================================================================
-cat(sprintf("══ 并行Bootstrap（%d次，%d workers，finishsamples=%d）══\n",
-            config$n_boot, config$n_workers, config$finish_samples))
-
-cl <- makeCluster(config$n_workers)
-registerDoParallel(cl)
-
-clusterExport(cl,
-    varlist = c("fit_one","extract_tipred","TI_COVS","std_params","config"),
-    envir   = environment())
-clusterEvalQ(cl, suppressPackageStartupMessages({
-    library(ctsem); library(dplyr)
-}))
-
-t_boot <- Sys.time()
-boot_results <- foreach(
-    b     = 1:config$n_boot,
-    input = all_boot_inputs,
-    .packages      = c("ctsem","dplyr"),
-    .errorhandling = "pass"
-) %dopar% {
-    res <- fit_one(input$data, TI_COVS, finish_samples=config$finish_samples)
-    res$boot_id  <- b
-    res$n_unique <- input$n_unique
-    res
+partial_file <- file.path(config$save_path, "boot_partial.rds")
+if(file.exists(partial_file)) {
+    boot_results <- readRDS(partial_file)
+    done    <- sum(sapply(boot_results, function(x) !is.null(x)))
+    start_b <- done + 1
+    cat(sprintf("📂 发现已保存进度，从第%d次续跑\n\n", start_b))
+} else {
+    boot_results <- vector("list", config$n_boot)
+    start_b      <- 1
 }
 
-stopCluster(cl)
-t_boot_total <- round(as.numeric(difftime(Sys.time(), t_boot, units="mins")),1)
+cat(sprintf("══ Bootstrap（%d次，finishsamples=%d）══\n",
+            config$n_boot, config$finish_samples))
+t_bs <- Sys.time()
 
+for(b in start_b:config$n_boot) {
+    cat(sprintf("[%d/%d] n_unique=%d 拟合中...",
+                b, config$n_boot, all_boot_inputs[[b]]$n_unique))
+    tb <- Sys.time()
+    r  <- fit_one(all_boot_inputs[[b]]$data,
+                  finish_samples=config$finish_samples)
+    r$boot_id  <- b
+    r$n_unique <- all_boot_inputs[[b]]$n_unique
+    boot_results[[b]] <- r
+
+    el <- round(as.numeric(difftime(Sys.time(),tb,units="mins")),1)
+    if(r$success) {
+        cat(sprintf(" ✅ %.1fmin | PP=%.4f AA=%.4f\n",
+                    el, r$drift$drift_PP, r$drift$drift_AA))
+    } else {
+        cat(sprintf(" ❌ %.1fmin | %s\n", el, r$error))
+    }
+
+    if(b%%5==0 || b==config$n_boot) {
+        saveRDS(boot_results, partial_file)
+        cat(sprintf("    💾 已保存（%d/%d）\n", b, config$n_boot))
+    }
+}
+
+t_total   <- round(as.numeric(difftime(Sys.time(),t_bs,units="mins")),1)
 n_success <- sum(sapply(boot_results, function(r) !is.null(r) && isTRUE(r$success)))
 n_fail    <- config$n_boot - n_success
-cat(sprintf("✅ 并行完成：%.1f分钟 | 成功%d / 失败%d\n\n", t_boot_total, n_success, n_fail))
-
-# 保存原始Bootstrap结果
-saveRDS(boot_results, file.path(config$save_path,"boot_results_raw.rds"))
+cat(sprintf("\n✅ Bootstrap完成 | %.1f分钟 | 成功%d 失败%d\n\n",
+            t_total, n_success, n_fail))
 
 # =============================================================================
-# 第4步：整理真Bootstrap CI
+# 第3步：整理结果
 # =============================================================================
-cat("══ 整理Bootstrap CI ══\n")
+cat("══ 整理结果 ══\n")
 
-# ── Drift ──
+# DRIFT汇总
 drift_df <- lapply(boot_results, function(r) {
     if(!is.null(r) && isTRUE(r$success) && !is.null(r$drift))
-        cbind(data.frame(boot_id=r$boot_id), r$drift)
+        cbind(data.frame(boot_id=r$boot_id, n_unique=r$n_unique), r$drift)
 }) %>% bind_rows()
 
-# ── TIPRED ──
-tipred_df <- lapply(boot_results, function(r) {
-    if(!is.null(r) && isTRUE(r$success) && !is.null(r$tipred))
-        cbind(data.frame(boot_id=r$boot_id), r$tipred)
-}) %>% bind_rows()
-
-cat(sprintf("  Drift行数: %d | TIPRED行数: %d\n", nrow(drift_df), nrow(tipred_df)))
-
-# ── Drift Bootstrap汇总 ──
-drift_boot_summary <- data.frame(
-    parameter = c("P→P(自回归)","A→A(自回归)","P→A(交叉)","A→P(交叉)"),
+drift_summary <- data.frame(
+    parameter = c("P_P","A_A","P_A","A_P"),
     original  = c(res_full$drift$drift_PP, res_full$drift$drift_AA,
                   res_full$drift$drift_PA, res_full$drift$drift_AP),
+    stringsAsFactors=FALSE
+) %>% mutate(
     boot_mean = c(mean(drift_df$drift_PP), mean(drift_df$drift_AA),
                   mean(drift_df$drift_PA), mean(drift_df$drift_AP)),
     boot_sd   = c(sd(drift_df$drift_PP),   sd(drift_df$drift_AA),
@@ -254,285 +316,245 @@ drift_boot_summary <- data.frame(
     ci_lo95   = c(quantile(drift_df$drift_PP,.025), quantile(drift_df$drift_AA,.025),
                   quantile(drift_df$drift_PA,.025), quantile(drift_df$drift_AP,.025)),
     ci_hi95   = c(quantile(drift_df$drift_PP,.975), quantile(drift_df$drift_AA,.975),
-                  quantile(drift_df$drift_PA,.975), quantile(drift_df$drift_AP,.975))
-) %>% mutate(
-    sig      = sign(ci_lo95)==sign(ci_hi95),
-    bias     = boot_mean - original,
-    se_boot  = boot_sd
+                  quantile(drift_df$drift_PA,.975), quantile(drift_df$drift_AP,.975)),
+    dir_pct   = c(mean(drift_df$drift_PP<0)*100,
+                  mean(drift_df$drift_AA<0)*100,
+                  mean(sign(drift_df$drift_PA)==sign(res_full$drift$drift_PA))*100,
+                  mean(sign(drift_df$drift_AP)==sign(res_full$drift$drift_AP))*100),
+    CV        = c(abs(sd(drift_df$drift_PP)/mean(drift_df$drift_PP)),
+                  abs(sd(drift_df$drift_AA)/mean(drift_df$drift_AA)),
+                  abs(sd(drift_df$drift_PA)/mean(drift_df$drift_PA)),
+                  abs(sd(drift_df$drift_AP)/mean(drift_df$drift_AP)))
 )
 
-# ── TIPRED Bootstrap汇总 ──
-tipred_boot_summary <- tipred_df %>%
-    group_by(parameter, predictor, target) %>%
-    summarise(
-        boot_mean = mean(mean,          na.rm=TRUE),
-        boot_sd   = sd(mean,            na.rm=TRUE),
-        ci_lo95   = quantile(mean,.025, na.rm=TRUE),
-        ci_hi95   = quantile(mean,.975, na.rm=TRUE),
-        n_valid   = sum(!is.na(mean)),
-        .groups   = "drop"
-    ) %>%
-    left_join(
-        res_full$tipred %>% rename(original=mean) %>% select(parameter,original),
-        by="parameter"
-    ) %>%
-    mutate(
-        sig      = sign(ci_lo95)==sign(ci_hi95),
-        bias     = boot_mean - original,
-        se_boot  = boot_sd,
-        # 稳定性标签
-        dir_pct  = mapply(function(par, orig) {
-            vals <- tipred_df$mean[tipred_df$parameter==par]
-            if(length(vals)==0 || is.na(orig)) return(NA_real_)
-            mean(sign(vals)==sign(orig), na.rm=TRUE)*100
-        }, parameter, original),
-        stability = case_when(
-            dir_pct >= 90 ~ "高稳定",
-            dir_pct >= 75 ~ "中稳定",
-            TRUE          ~ "低稳定"
-        )
-    ) %>%
-    arrange(target, predictor)
-
-# =============================================================================
-# 第5步：打印结果摘要
-# =============================================================================
-cat("\n══════════════════════════════════════════════════════\n")
-cat("         DRIFT参数 Bootstrap结果（可发表）\n")
-cat("══════════════════════════════════════════════════════\n")
-cat(sprintf("%-12s  %8s  %8s  %7s  %20s  %s\n",
-            "参数","原始值","Boot均","SE","Bootstrap 95%CI","显著"))
+cat("\n【DRIFT参数Bootstrap汇总】\n")
+cat(sprintf("%-5s  %8s  %8s  %7s  %20s  %6s  %5s\n",
+            "参数","原始值","Boot均","SD","95%CI","方向%","CV"))
 cat(paste(rep("─",72),collapse=""),"\n")
-for(i in 1:nrow(drift_boot_summary)) {
-    r <- drift_boot_summary[i,]
-    cat(sprintf("%-12s  %8.4f  %8.4f  %7.4f  [%7.4f, %7.4f]  %s\n",
-                r$parameter, r$original, r$boot_mean, r$se_boot,
-                r$ci_lo95, r$ci_hi95,
-                ifelse(r$sig,"✅ 显著","—")))
+for(i in 1:nrow(drift_summary)) {
+    r <- drift_summary[i,]
+    cat(sprintf("%-5s  %8.4f  %8.4f  %7.4f  [%7.4f,%7.4f]  %5.0f%%  %.2f\n",
+                r$parameter, r$original, r$boot_mean, r$boot_sd,
+                r$ci_lo95, r$ci_hi95, r$dir_pct, r$CV))
 }
 
-cat("\n══════════════════════════════════════════════════════\n")
-cat("   TI预测变量效应 Bootstrap结果（可发表）\n")
-cat("══════════════════════════════════════════════════════\n")
+# TIPRED汇总
+tipred_df <- lapply(boot_results, function(r) {
+    if(!is.null(r) && isTRUE(r$success) && !is.null(r$tipred))
+        cbind(data.frame(boot_id=r$boot_id), r$tipred)
+}) %>% bind_rows()
 
-for(tgt in c("eta_P","eta_A")) {
-    cat(sprintf("\n  目标变量：%s\n", ifelse(tgt=="eta_P","η_P（正向情绪）","η_A（负向情绪）")))
-    cat(sprintf("  %-18s  %8s  %8s  %7s  %20s  %7s  %s\n",
-                "预测变量","原始值","Boot均","SE","Bootstrap 95%CI","方向%","显著"))
-    cat("  ",paste(rep("─",80),collapse=""),"\n")
-    sub <- tipred_boot_summary %>% filter(target==tgt)
-    for(i in 1:nrow(sub)) {
-        r <- sub[i,]
-        cat(sprintf("  %-18s  %8.4f  %8.4f  %7.4f  [%7.4f, %7.4f]  %6.0f%%  %s\n",
-                    r$predictor,
-                    ifelse(is.na(r$original),0,r$original),
-                    r$boot_mean, r$se_boot,
-                    r$ci_lo95, r$ci_hi95,
-                    ifelse(is.na(r$dir_pct),0,r$dir_pct),
-                    ifelse(r$sig,"✅","—")))
+cat(sprintf("\n✅ TIPRED原始数据：%d行（预期%d×28=%d）\n",
+            nrow(tipred_df), n_success, n_success*28))
+
+# 验证无重复
+if(nrow(tipred_df) > 0) {
+    dup <- tipred_df %>%
+        group_by(boot_id, predictor, target) %>%
+        summarise(n=n(), .groups="drop") %>% filter(n>1)
+    if(nrow(dup)>0) cat(sprintf("⚠️ 仍有%d个重复组合！\n", nrow(dup)))
+    else            cat("✅ 无重复行确认\n")
+}
+
+tipred_summary <- NULL
+if(nrow(tipred_df) > 0) {
+    tipred_summary <- tipred_df %>%
+        group_by(predictor, target) %>%
+        summarise(
+            original = {
+                ov <- res_full$tipred$value[
+                    res_full$tipred$predictor==first(predictor) &
+                    res_full$tipred$target==first(target)]
+                if(length(ov)>0) ov[1] else NA_real_
+            },
+            boot_mean = mean(value, na.rm=TRUE),
+            boot_sd   = sd(value,   na.rm=TRUE),
+            ci_lo95   = quantile(value, .025, na.rm=TRUE),
+            ci_hi95   = quantile(value, .975, na.rm=TRUE),
+            dir_pct   = {
+                ov <- res_full$tipred$value[
+                    res_full$tipred$predictor==first(predictor) &
+                    res_full$tipred$target==first(target)]
+                if(length(ov)>0 && !is.na(ov[1]))
+                    mean(sign(value)==sign(ov[1]), na.rm=TRUE)*100
+                else NA_real_
+            },
+            CV     = abs(sd(value,na.rm=TRUE)/mean(value,na.rm=TRUE)),
+            n_boot = n(),
+            .groups= "drop"
+        ) %>%
+        mutate(
+            sig       = sign(ci_lo95) == sign(ci_hi95),
+            parameter = paste0(predictor, "_->_", target),
+            stability = case_when(
+                dir_pct>=90 & CV<0.5 ~ "高稳定",
+                dir_pct>=75 & CV<1.0 ~ "中稳定",
+                TRUE                 ~ "低稳定"
+            )
+        )
+
+    cat(sprintf("\n✅ TIpred汇总：%d行（预期28）\n", nrow(tipred_summary)))
+
+    cat("\n【TI预测变量Bootstrap汇总（7×4=28行）】\n")
+    for(tgt in c("P_P","A_A","P_A","A_P")) {
+        cat(sprintf("\n── %s ──\n", tgt))
+        sub <- tipred_summary %>% filter(target==tgt) %>%
+               arrange(desc(abs(boot_mean)))
+        cat(sprintf("  %-18s %8s %8s %7s %20s %5s %s\n",
+                    "Predictor","原始值","Boot均","SD","95%CI","方向%","稳定性"))
+        for(i in 1:nrow(sub)) {
+            r <- sub[i,]
+            cat(sprintf("  %-18s %8.4f %8.4f %7.4f [%7.4f,%7.4f] %4.0f%% %s%s\n",
+                        r$predictor,
+                        ifelse(is.na(r$original),0,r$original),
+                        r$boot_mean, r$boot_sd,
+                        r$ci_lo95, r$ci_hi95,
+                        ifelse(is.na(r$dir_pct),0,r$dir_pct),
+                        r$stability,
+                        ifelse(isTRUE(r$sig)," ★","")))
+        }
+    }
+
+    sig_eff <- tipred_summary %>% filter(isTRUE(sig))
+    cat(sprintf("\n【★显著效应（95%%CI不含0）：%d个】\n", nrow(sig_eff)))
+    if(nrow(sig_eff) > 0) {
+        for(i in 1:nrow(sig_eff)) {
+            r <- sig_eff[i,]
+            cat(sprintf("  %s → %s  orig=%.4f  boot=%.4f  [%.4f,%.4f]  dir=%.0f%%\n",
+                        r$predictor, r$target,
+                        ifelse(is.na(r$original),0,r$original),
+                        r$boot_mean, r$ci_lo95, r$ci_hi95, r$dir_pct))
+        }
+    } else {
+        cat("  （无，与N=30小样本预期一致）\n")
     }
 }
 
 # =============================================================================
-# 第6步：保存CSV（论文可直接用）
+# 第4步：保存CSV
 # =============================================================================
-write.csv(drift_boot_summary,  file.path(config$save_path,"Table1_DRIFT_Bootstrap.csv"),  row.names=FALSE)
-write.csv(tipred_boot_summary, file.path(config$save_path,"Table2_TIpred_Bootstrap.csv"), row.names=FALSE)
-write.csv(drift_df,            file.path(config$save_path,"Raw_DRIFT_allboots.csv"),      row.names=FALSE)
-write.csv(tipred_df,           file.path(config$save_path,"Raw_TIpred_allboots.csv"),     row.names=FALSE)
-cat("\n✅ 论文表格CSV已保存\n")
+write.csv(drift_summary,
+          file.path(config$save_path,"DRIFT_summary.csv"), row.names=FALSE)
+write.csv(drift_df,
+          file.path(config$save_path,"DRIFT_all_boots.csv"), row.names=FALSE)
+if(!is.null(tipred_summary)) {
+    write.csv(tipred_summary,
+              file.path(config$save_path,"TIpred_summary.csv"), row.names=FALSE)
+    write.csv(tipred_df,
+              file.path(config$save_path,"TIpred_all_boots.csv"), row.names=FALSE)
+}
+cat("\n✅ CSV已保存至:", config$save_path, "\n")
 
 # =============================================================================
-# 第7步：可视化（论文级图表）
+# 第5步：可视化
 # =============================================================================
-cat("══ 生成图表 ══\n")
+cat("\n══ 生成图表 ══\n")
 
-# ── 图1：TIPRED效应 Bootstrap 95%CI 森林图 ──
-tryCatch({
-    plot_df <- tipred_boot_summary %>%
-        mutate(
-            predictor_label = recode(predictor,
-                age="年龄", gender="性别",
-                PC1="PC1(人格因子1)", PC2="PC2(人格因子2)"),
-            target_label = ifelse(target=="eta_P","η_P 正向情绪","η_A 负向情绪"),
-            sig_label    = ifelse(sig,"显著（CI不含0）","不显著")
-        )
-
-    p1 <- ggplot(plot_df,
-                 aes(x=reorder(predictor_label, boot_mean),
-                     y=boot_mean, color=sig_label)) +
-        geom_hline(yintercept=0, linetype="dashed", color="gray50", linewidth=0.8) +
-        geom_errorbar(aes(ymin=ci_lo95, ymax=ci_hi95),
-                      width=0.25, linewidth=0.9) +
-        geom_point(aes(shape=sig_label), size=3.5, fill="white") +
-        geom_point(data=plot_df %>% rename(orig=original),
-                   aes(y=orig), shape=4, size=2.5, color="gray40") +
-        scale_color_manual(values=c("显著（CI不含0）"="#C0392B","不显著"="gray55")) +
-        scale_shape_manual(values=c("显著（CI不含0）"=16,"不显著"=21)) +
-        coord_flip() +
-        facet_wrap(~target_label, ncol=2) +
-        labs(
-            title    = "Time-Invariant Predictor Effects on Latent Processes",
-            subtitle = sprintf("Bootstrap 95%% CI (n=%d resamples); ×=original estimate", n_success),
-            x        = "Predictor",
-            y        = "Effect Size (Standardized)",
-            color    = "Significance",
-            shape    = "Significance"
-        ) +
-        theme_bw(base_size=13) +
-        theme(
-            plot.title    = element_text(hjust=.5, face="bold", size=14),
-            plot.subtitle = element_text(hjust=.5, color="gray40", size=11),
-            legend.position = "bottom",
-            strip.text      = element_text(face="bold", size=12),
-            panel.grid.minor = element_blank()
-        )
-
-    ggsave(file.path(config$save_path,"plots","Fig1_TIpred_ForestPlot.png"),
-           p1, width=12, height=7, dpi=300)
-    cat("  ✅ Fig1_TIpred_ForestPlot.png\n")
-}, error=function(e) cat("  ❌ 森林图:", e$message,"\n"))
-
-# ── 图2：Drift参数 Bootstrap分布 ──
+# 图1：DRIFT分布
 tryCatch({
     drift_long <- drift_df %>%
         pivot_longer(c(drift_PP,drift_AA,drift_PA,drift_AP),
                      names_to="param", values_to="value") %>%
-        mutate(param = recode(param,
-            drift_PP="P→P (Auto-regression)",
-            drift_AA="A→A (Auto-regression)",
-            drift_PA="P→A (Cross-lagged)",
-            drift_AP="A→P (Cross-lagged)"))
+        mutate(param=recode(param,
+            drift_PP="P_P（P自回归）", drift_AA="A_A（A自回归）",
+            drift_PA="P_A（P→A）",    drift_AP="A_P（A→P）"))
+    ref_df <- data.frame(
+        param=c("P_P（P自回归）","A_A（A自回归）","P_A（P→A）","A_P（A→P）"),
+        ref  =c(res_full$drift$drift_PP,res_full$drift$drift_AA,
+                res_full$drift$drift_PA,res_full$drift$drift_AP))
+    p1 <- ggplot(drift_long,aes(x=value)) +
+        geom_histogram(fill="#3C5488",alpha=.75,bins=20,color="white") +
+        geom_vline(data=ref_df,aes(xintercept=ref),
+                   color="red",linetype="dashed",linewidth=1) +
+        facet_wrap(~param,scales="free",ncol=2) +
+        labs(title=sprintf("Bootstrap DRIFT参数分布（n=%d次成功，N=30）",n_success),
+             subtitle="红虚线=原始完整样本估计值",x="参数估计值",y="频数") +
+        theme_minimal(base_size=13) +
+        theme(plot.title=element_text(hjust=.5,face="bold"),
+              strip.text=element_text(face="bold"))
+    ggsave(file.path(config$save_path,"plots","01_DRIFT_distribution.png"),
+           p1,width=12,height=8,dpi=300)
+    cat("  ✅ 01_DRIFT_distribution.png\n")
+}, error=function(e) cat("  ❌",e$message,"\n"))
 
-    ci_df <- drift_boot_summary %>%
-        mutate(param = recode(parameter,
-            "P→P(自回归)"="P→P (Auto-regression)",
-            "A→A(自回归)"="A→A (Auto-regression)",
-            "P→A(交叉)"  ="P→A (Cross-lagged)",
-            "A→P(交叉)"  ="A→P (Cross-lagged)"))
+# 图2：TIpred置信区间（4个target分面）
+if(!is.null(tipred_summary)) {
+    tryCatch({
+        p2 <- tipred_summary %>%
+            mutate(
+                sig_label = ifelse(isTRUE(sig),"★显著","不显著"),
+                target    = factor(target, levels=c("P_P","A_A","P_A","A_P"))
+            ) %>%
+            ggplot(aes(x=reorder(predictor,boot_mean),
+                       y=boot_mean, color=sig_label)) +
+            geom_hline(yintercept=0,linetype="dashed",color="gray50") +
+            geom_errorbar(aes(ymin=ci_lo95,ymax=ci_hi95),
+                          width=.3,linewidth=.9) +
+            geom_point(size=3) +
+            scale_color_manual(
+                values=c("★显著"="#E74C3C","不显著"="gray60")) +
+            facet_wrap(~target,ncol=2,scales="free_x") +
+            coord_flip() +
+            labs(title="大五人格+年龄+性别对情绪动态的影响（Bootstrap 95% CI）",
+                 subtitle=sprintf("N=30，%d次Bootstrap，探索性分析",n_success),
+                 x="",y="效应量（标准化）",color="") +
+            theme_bw(base_size=12) +
+            theme(legend.position="bottom",
+                  plot.title=element_text(hjust=.5,face="bold"),
+                  strip.text=element_text(face="bold",size=11))
+        ggsave(file.path(config$save_path,"plots","02_TIpred_CI.png"),
+               p2,width=13,height=10,dpi=300)
+        cat("  ✅ 02_TIpred_CI.png\n")
+    }, error=function(e) cat("  ❌",e$message,"\n"))
 
-    p2 <- ggplot(drift_long, aes(x=value)) +
-        geom_histogram(aes(y=after_stat(density)),
-                       bins=25, fill="#2C3E7A", alpha=.75, color="white") +
-        geom_density(color="#2C3E7A", linewidth=1) +
-        geom_vline(data=ci_df, aes(xintercept=original),
-                   color="#E74C3C", linetype="dashed", linewidth=1.2) +
-        geom_vline(data=ci_df, aes(xintercept=ci_lo95),
-                   color="orange", linetype="dotted", linewidth=0.9) +
-        geom_vline(data=ci_df, aes(xintercept=ci_hi95),
-                   color="orange", linetype="dotted", linewidth=0.9) +
-        facet_wrap(~param, scales="free", ncol=2) +
-        labs(
-            title    = "Bootstrap Distribution of DRIFT Parameters",
-            subtitle = "Red dashed = original estimate; Orange dotted = 95% CI bounds",
-            x        = "Parameter Estimate", y = "Density"
-        ) +
-        theme_bw(base_size=13) +
-        theme(
-            plot.title    = element_text(hjust=.5, face="bold"),
-            plot.subtitle = element_text(hjust=.5, color="gray40"),
-            strip.text    = element_text(face="bold"),
-            panel.grid.minor = element_blank()
-        )
-
-    ggsave(file.path(config$save_path,"plots","Fig2_DRIFT_Bootstrap.png"),
-           p2, width=12, height=8, dpi=300)
-    cat("  ✅ Fig2_DRIFT_Bootstrap.png\n")
-}, error=function(e) cat("  ❌ Drift图:", e$message,"\n"))
-
-# ── 图3：PCA载荷图 ──
-tryCatch({
-    load_df <- as.data.frame(pca_fit$rotation[,1:config$n_pca_comp]) %>%
-        mutate(Trait=rownames(.)) %>%
-        pivot_longer(-Trait, names_to="PC", values_to="Loading") %>%
-        mutate(Trait=recode(Trait,
-            Extraversion="外倾性", Agreeableness="宜人性",
-            Conscientiousness="尽责性", Neuroticism="神经质", Openness="开放性"))
-
-    var_pct <- round(var_exp["Proportion of Variance",1:config$n_pca_comp]*100,1)
-    pc_labs <- paste0(names(var_pct)," (",var_pct,"%)")
-    names(pc_labs) <- names(var_pct)
-
-    p3 <- ggplot(load_df, aes(x=reorder(Trait,abs(Loading)), y=Loading, fill=Loading>0)) +
-        geom_col(show.legend=FALSE, alpha=.85, width=.65) +
-        geom_hline(yintercept=0, linewidth=.5) +
-        coord_flip() +
-        facet_wrap(~PC, labeller=as_labeller(pc_labs)) +
-        scale_fill_manual(values=c("TRUE"="#2C3E7A","FALSE"="#C0392B")) +
-        labs(title="PCA Factor Loadings (Big Five Personality)",
-             x="", y="Loading") +
-        theme_bw(base_size=13) +
-        theme(plot.title=element_text(hjust=.5, face="bold"),
-              strip.text=element_text(face="bold"),
-              panel.grid.minor=element_blank())
-
-    ggsave(file.path(config$save_path,"plots","Fig3_PCA_Loadings.png"),
-           p3, width=10, height=5, dpi=300)
-    cat("  ✅ Fig3_PCA_Loadings.png\n")
-}, error=function(e) cat("  ❌ PCA图:", e$message,"\n"))
-
-# ── 图4：Bootstrap稳定性总览热图 ──
-tryCatch({
-    p4 <- tipred_boot_summary %>%
-        mutate(
-            predictor = recode(predictor,
-                age="年龄", gender="性别",
-                PC1="PC1", PC2="PC2"),
-            target = recode(target,
-                eta_P="η_P 正向情绪", eta_A="η_A 负向情绪"),
-            dir_pct_fill = pmin(dir_pct, 100)
-        ) %>%
-        ggplot(aes(x=target, y=predictor, fill=dir_pct_fill)) +
-        geom_tile(color="white", linewidth=1) +
-        geom_text(aes(
-            label=paste0(round(boot_mean,3),"\n[",round(ci_lo95,3),",",round(ci_hi95,3),"]\n",
-                         ifelse(sig,"*","")),
-            color=dir_pct_fill>60), size=3.2, lineheight=1.1) +
-        scale_fill_gradient2(
-            low="#3498DB", mid="white", high="#E74C3C",
-            midpoint=50, limits=c(0,100),
-            name="方向一致性(%)") +
-        scale_color_manual(values=c("TRUE"="black","FALSE"="white"), guide="none") +
-        labs(
-            title    = "Bootstrap Stability Heatmap",
-            subtitle = "Cell: Boot mean [95% CI]; * = significant (CI excludes 0)",
-            x="", y=""
-        ) +
-        theme_bw(base_size=13) +
-        theme(
-            plot.title      = element_text(hjust=.5, face="bold"),
-            plot.subtitle   = element_text(hjust=.5, color="gray40"),
-            axis.text       = element_text(face="bold"),
-            legend.position = "right"
-        )
-
-    ggsave(file.path(config$save_path,"plots","Fig4_Stability_Heatmap.png"),
-           p4, width=10, height=6, dpi=300)
-    cat("  ✅ Fig4_Stability_Heatmap.png\n")
-}, error=function(e) cat("  ❌ 热图:", e$message,"\n"))
+    # 图3：方向一致性热图
+    tryCatch({
+        p3 <- tipred_summary %>%
+            mutate(
+                dg = case_when(
+                    dir_pct>=90 ~ "≥90%（高）",
+                    dir_pct>=75 ~ "75-90%（中）",
+                    TRUE        ~ "<75%（低）"),
+                dg     = factor(dg,levels=c("≥90%（高）","75-90%（中）","<75%（低）")),
+                target = factor(target,levels=c("P_P","A_A","P_A","A_P"))
+            ) %>%
+            ggplot(aes(x=target,y=predictor,fill=dg)) +
+            geom_tile(color="white",linewidth=.8) +
+            geom_text(aes(label=sprintf("%.0f%%\n%.3f",dir_pct,boot_mean)),
+                      size=3.2) +
+            scale_fill_manual(values=c(
+                "≥90%（高）"   ="#00A087",
+                "75-90%（中）" ="#F39B7F",
+                "<75%（低）"   ="#E64B35")) +
+            labs(title="Bootstrap方向一致性热图（数字=方向%/Boot均值）",
+                 subtitle="探索性分析：展示效应方向跨样本的稳定程度",
+                 x="目标参数",y="预测变量",fill="方向一致性") +
+            theme_minimal(base_size=12) +
+            theme(plot.title=element_text(hjust=.5,face="bold"))
+        ggsave(file.path(config$save_path,"plots","03_direction_heatmap.png"),
+               p3,width=10,height=7,dpi=300)
+        cat("  ✅ 03_direction_heatmap.png\n")
+    }, error=function(e) cat("  ❌",e$message,"\n"))
+}
 
 # =============================================================================
-# 最终摘要
+# 完成
 # =============================================================================
-cat("\n╔══════════════════════════════════════════════════╗\n")
-cat("║              分析完成 ── 结果摘要                ║\n")
-cat("╠══════════════════════════════════════════════════╣\n")
-cat(sprintf("║  Bootstrap次数   : %d 次（成功%d / 失败%d）%s\n",
-            config$n_boot, n_success, n_fail,
-            paste(rep(" ",max(0,14-nchar(sprintf("%d/%d",n_success,n_fail)))),collapse="")))
-cat(sprintf("║  Bootstrap耗时   : %.1f 分钟\n", t_boot_total))
-cat(sprintf("║  显著DRIFT参数   : %d / %d\n",
-            sum(drift_boot_summary$sig), nrow(drift_boot_summary)))
-cat(sprintf("║  显著TI效应      : %d / %d\n",
-            sum(tipred_boot_summary$sig), nrow(tipred_boot_summary)))
-cat("╠══════════════════════════════════════════════════╣\n")
-cat("║  输出文件：                                      ║\n")
-cat("║  Table1_DRIFT_Bootstrap.csv   ← 论文Table 1     ║\n")
-cat("║  Table2_TIpred_Bootstrap.csv  ← 论文Table 2     ║\n")
-cat("║  Fig1_TIpred_ForestPlot.png   ← 论文Figure 1    ║\n")
-cat("║  Fig2_DRIFT_Bootstrap.png     ← 论文Figure 2    ║\n")
-cat("║  Fig3_PCA_Loadings.png        ← 论文Figure 3    ║\n")
-cat("║  Fig4_Stability_Heatmap.png   ← 论文Figure 4    ║\n")
-cat(sprintf("║  保存路径: %-38s║\n", config$save_path))
-cat("╚══════════════════════════════════════════════════╝\n")
-cat("🎉 全部完成！\n")
+cat("\n══════════════════════════════════════════\n")
+cat(sprintf("  完成！成功%d / 失败%d\n", n_success, n_fail))
+cat(sprintf("  总耗时：%.1f分钟\n", t_total))
+cat(sprintf("  结果：%s\n", config$save_path))
+cat("  输出文件：\n")
+cat("    DRIFT_summary.csv      — DRIFT参数汇总\n")
+cat("    DRIFT_all_boots.csv    — DRIFT每次原始值\n")
+cat("    TIpred_summary.csv     — TI效应汇总（28行=7×4，无重复）\n")
+cat("    TIpred_all_boots.csv   — TI效应每次原始值\n")
+cat("    plots/01~03.png        — 可视化图表\n")
+cat("══════════════════════════════════════════\n")
+if(config$n_boot <= 5) {
+    cat("\n★ 当前为测试模式（n_boot=", config$n_boot, "）\n")
+    cat("  确认结果正确后，将代码顶部改为：\n")
+    cat("    n_boot         = 50\n")
+    cat("    finish_samples = 200\n")
+    cat("  删除boot_partial.rds后重新运行完整版\n")
+}

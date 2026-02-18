@@ -4,10 +4,6 @@ suppressPackageStartupMessages({
     library(ggplot2); library(ctsem); library(zoo)
     library(foreach); library(doParallel)
 })
-
-# =============================================================================
-# 配置（只改这里）
-# =============================================================================
 config <- list(
     data_path      = "C:/Users/22825/Desktop/data.xlsx",
     save_path      = "C:/Users/22825/Desktop/sanxiu",
@@ -46,9 +42,7 @@ unique_ids <- unique(dat$id)
 N          <- length(unique_ids)
 cat(sprintf("✅ %d观测, %d个体\n\n", nrow(dat), N))
 
-# =============================================================================
-# PCA降维（完整样本固定旋转，Bootstrap复用，不重算）
-# =============================================================================
+# PCA降维
 BIG5_COLS <- c("Extraversion","Agreeableness","Conscientiousness","Neuroticism","Openness")
 
 cat("══ PCA降维 ══\n")
